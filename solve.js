@@ -107,17 +107,20 @@ function wordsOf(text) {
   return n;
 }
 
-/** `rel` (a link's path) from the directory `dir` of a source, or null when it climbs out of the root. */
-function resolveRel(dir, rel) {
-  const parts = dir === '' ? [] : dir.split('/');
-  const segs = rel.split('/');
-  for (let i = 0; i < segs.length; i++) {
-    const seg = segs[i];
-    if (seg === '' || seg === '.') continue;
+/** `rel` (a link's path) from a directory given as its segments, or null when it climbs out of the root. */
+function resolveRel(dirParts, rel) {
+  const parts = dirParts.slice();
+  let i = 0;
+  const n = rel.length;
+  while (i <= n) {
+    let k = rel.indexOf('/', i);
+    if (k === -1) k = n;
+    const seg = rel.slice(i, k);
     if (seg === '..') {
       if (parts.length === 0) return null;
       parts.pop();
-    } else parts.push(seg);
+    } else if (seg !== '' && seg !== '.') parts.push(seg);
+    i = k + 1;
   }
   return parts.join('/');
 }
@@ -336,8 +339,13 @@ function orderedOf(line) {
 const CONTINUED = /^ {2,}\S/;
 
 /** Whether `line` ends a paragraph: a blank line, a fence, a heading or a thematic break. */
-function endsPara(line) {
-  return isBlank(line) || fenceOpen(line) !== null || headingOf(line) !== null || isHR(line);
+function paraBreak(line) {
+  const c0 = line.charCodeAt(0);
+  if (c0 === 32 || c0 === 9 || line.length === 0) return isBlank(line);
+  if (c0 === 96) return fenceOpen(line) !== null;
+  if (c0 === 35) return headingOf(line) !== null;
+  if (c0 === 45 || c0 === 42) return isHR(line);
+  return false;
 }
 
 /** The characters a backslash escapes. */
@@ -379,27 +387,51 @@ function findSingleStar(s, from) {
 
 const HAS_WS = /\s/;
 
+// One scan finds the next character that matters inline: a Markdown special
+// or a character the escape table names. The runs between two such stops hold
+// neither, so they are copied raw — no separate escaping pass.
+const SPEC = /[\\`*[&<>"']/g;
+
 /** `s` rendered inline; `link(target)` is a link's href. */
 function inlineMd(s, link) {
   let out = '';
   let i = 0;
   const n = s.length;
   while (i < n) {
-    let next = n;
-    let k = s.indexOf('\\', i);
-    if (k !== -1 && k < next) next = k;
-    k = s.indexOf('`', i);
-    if (k !== -1 && k < next) next = k;
-    k = s.indexOf('*', i);
-    if (k !== -1 && k < next) next = k;
-    k = s.indexOf('[', i);
-    if (k !== -1 && k < next) next = k;
+    SPEC.lastIndex = i;
+    const m = SPEC.exec(s);
+    const next = m === null ? n : m.index;
     if (next > i) {
-      out += esc(s.slice(i, next));
+      out += s.slice(i, next);
       i = next;
     }
     if (i >= n) break;
     const c = s[i];
+    if (c === '&') {
+      out += '&amp;';
+      i++;
+      continue;
+    }
+    if (c === '<') {
+      out += '&lt;';
+      i++;
+      continue;
+    }
+    if (c === '>') {
+      out += '&gt;';
+      i++;
+      continue;
+    }
+    if (c === '"') {
+      out += '&quot;';
+      i++;
+      continue;
+    }
+    if (c === "'") {
+      out += '&#39;';
+      i++;
+      continue;
+    }
     if (c === '\\') {
       if (i + 1 < n && ESCAPABLE.indexOf(s[i + 1]) !== -1) {
         out += esc(s[i + 1]);
@@ -445,11 +477,11 @@ function inlineMd(s, link) {
     }
     // c === '['
     const k2 = findUnesc(s, ']', i + 1);
-    const m = k2 !== -1 && s[k2 + 1] === '(' ? s.indexOf(')', k2 + 2) : -1;
-    const target = m === -1 ? '' : s.slice(k2 + 2, m);
+    const m2 = k2 !== -1 && s[k2 + 1] === '(' ? s.indexOf(')', k2 + 2) : -1;
+    const target = m2 === -1 ? '' : s.slice(k2 + 2, m2);
     if (target !== '' && !HAS_WS.test(target)) {
       out += `<a href="${esc(link(target))}">${inlineMd(s.slice(i + 1, k2), link)}</a>`;
-      i = m + 1;
+      i = m2 + 1;
     } else {
       out += '[';
       i++;
@@ -473,37 +505,44 @@ function renderMd(src, link, slugFn) {
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
-    if (isBlank(line)) {
-      i++;
-      continue;
-    }
-    const lang = fenceOpen(line);
-    if (lang !== null) {
-      i++;
-      let code = '<pre><code';
-      if (lang !== '') code += ` class="language-${esc(lang)}"`;
-      code += '>';
-      while (i < n && !isFenceClose(lines[i])) code += `${esc(lines[i++])}\n`;
-      i++;
-      code += '</code></pre>';
-      out.push(code);
-      continue;
-    }
-    const hd = headingOf(line);
-    if (hd !== null) {
-      const id = uniqSlug(slugFn(hd.text), ids);
-      const html = inlineMd(hd.text, link);
-      out.push(`<h${hd.depth} id="${id}">${html}</h${hd.depth}>`);
-      if (hd.depth === 2 || hd.depth === 3) toc.push({ level: hd.depth, id, html });
-      i++;
-      continue;
-    }
-    if (isHR(line)) {
-      out.push('<hr>');
-      i++;
-      continue;
-    }
-    if (line.charCodeAt(0) === 62) {
+    const c0 = line.charCodeAt(0);
+    let first = null;
+    if (c0 === 32 || c0 === 9 || line.length === 0) {
+      if (isBlank(line)) {
+        i++;
+        continue;
+      }
+    } else if (c0 === 96) {
+      const lang = fenceOpen(line);
+      if (lang !== null) {
+        i++;
+        let code = '<pre><code';
+        if (lang !== '') code += ` class="language-${esc(lang)}"`;
+        code += '>';
+        while (i < n && !isFenceClose(lines[i])) code += `${esc(lines[i++])}\n`;
+        i++;
+        code += '</code></pre>';
+        out.push(code);
+        continue;
+      }
+    } else if (c0 === 35) {
+      const hd = headingOf(line);
+      if (hd !== null) {
+        const id = uniqSlug(slugFn(hd.text), ids);
+        const html = inlineMd(hd.text, link);
+        out.push(`<h${hd.depth} id="${id}">${html}</h${hd.depth}>`);
+        if (hd.depth === 2 || hd.depth === 3) toc.push({ level: hd.depth, id, html });
+        i++;
+        continue;
+      }
+    } else if (c0 === 45 || c0 === 42) {
+      if (isHR(line)) {
+        out.push('<hr>');
+        i++;
+        continue;
+      }
+      first = bulletOf(line);
+    } else if (c0 === 62) {
       const q = [];
       while (i < n && lines[i].charCodeAt(0) === 62) {
         let ql = lines[i++].slice(1);
@@ -513,8 +552,9 @@ function renderMd(src, link, slugFn) {
       }
       out.push(q.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inlineMd(q.join('\n'), link)}</p>\n</blockquote>`);
       continue;
+    } else if (c0 >= 48 && c0 <= 57) {
+      first = orderedOf(line);
     }
-    const first = bulletOf(line) ?? orderedOf(line);
     if (first !== null) {
       const items = [];
       let cur = [trimLt(first.text)];
@@ -541,7 +581,7 @@ function renderMd(src, link, slugFn) {
     }
     const para = [trimLt(line)];
     i++;
-    while (i < n && !endsPara(lines[i])) para.push(trimLt(lines[i++]));
+    while (i < n && !paraBreak(lines[i])) para.push(trimLt(lines[i++]));
     const html = inlineMd(para.join('\n'), link);
     if (excerpt === null) excerpt = html;
     out.push(`<p>${html}</p>`);
@@ -929,6 +969,7 @@ export function run(input) {
   const resCache = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
+    const dirParts = dir === '' ? [] : dir.split('/');
     const link = (target) => {
       if (isScheme(target) || target.startsWith('/') || target.startsWith('#')) return target;
       const key = `${dir}\n${target}`;
@@ -937,7 +978,7 @@ export function run(input) {
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolveRel(dir, rel);
+        const path = rel === '' ? null : resolveRel(dirParts, rel);
         if (path !== null && bySource.has(path)) href = bySource.get(path).url + frag;
         else if (path !== null && staticPaths.has(path)) href = `${base}/${path}${frag}`;
         else href = null;
@@ -1003,43 +1044,45 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const render = (name, vars) => {
-    const O = [];
-    const S = Object.create(null);
-    S.site = site;
-    S.tags = allTags;
-    S.recent = recent;
-    S.page = vars.page;
-    S.posts = vars.posts;
-    S.pager = vars.pager;
-    S.tag = vars.tag;
+  // One scope object and one output array serve every render of the case: a
+  // loop always restores the bindings it sets, so the scope comes back clean.
+  const scratchO = [];
+  const scratchS = Object.create(null);
+  scratchS.site = site;
+  scratchS.tags = allTags;
+  scratchS.recent = recent;
+  const render = (name, page, posts, pager, tag) => {
+    const S = scratchS;
+    S.page = page;
+    S.posts = posts;
+    S.pager = pager;
+    S.tag = tag;
     if (compiled !== null) {
       const fn = compiled[name];
       if (fn === undefined) return null;
-      fn(O, S, 0);
+      fn(scratchO, S, 0);
     } else {
       const nodes = parsed.get(name);
       if (nodes === undefined) return null;
-      interpNodes(nodes, S, 0, parsed, O);
+      interpNodes(nodes, S, 0, parsed, scratchO);
     }
-    return O.join('');
+    const html = scratchO.join('');
+    scratchO.length = 0;
+    return html;
   };
-  for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s, cards) });
+  for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, pageOf(s, cards), undefined, undefined, undefined);
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
   const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
   for (let k = 1; k <= pages; k++) {
-    const html = render('index', {
-      posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)),
-      pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
-    });
+    const html = render('index', undefined, posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)), { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) }, undefined);
     if (html !== null) output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
   }
   for (const t of tags) {
-    const html = render('tag', { tag: tagOf(t, cards) });
+    const html = render('tag', undefined, undefined, undefined, tagOf(t, cards));
     if (html !== null) output[`tags/${t.slug}/index.html`] = html;
   }
-  const tagsHtml = render('tags', {});
+  const tagsHtml = render('tags', undefined, undefined, undefined, undefined);
   if (tagsHtml !== null) output['tags/index.html'] = tagsHtml;
   for (const f of statics) {
     if (has(output, f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
