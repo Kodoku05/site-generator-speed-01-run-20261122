@@ -768,12 +768,12 @@ function pathExpr(path) {
   return e;
 }
 
-/** JavaScript statements for `nodes`, appended to `parts`. */
+/** JavaScript statements for `nodes`, appended to `parts`. `O` is the output string, built by rope concatenation. */
 function genNodes(nodes, parts) {
   for (const nd of nodes) {
-    if (nd.kind === 'text') parts.push(`O.push(${JSON.stringify(nd.text)});`);
-    else if (nd.kind === 'var') parts.push(`O.push(ev(${pathExpr(nd.path)}));`);
-    else if (nd.kind === 'raw') parts.push(`O.push(tv(${pathExpr(nd.path)}));`);
+    if (nd.kind === 'text') parts.push(`O+=${JSON.stringify(nd.text)};`);
+    else if (nd.kind === 'var') parts.push(`O+=ev(${pathExpr(nd.path)});`);
+    else if (nd.kind === 'raw') parts.push(`O+=tv(${pathExpr(nd.path)});`);
     else if (nd.kind === 'if') {
       parts.push(`if(tru(${pathExpr(nd.path)})!==${nd.not ? 'true' : 'false'}){`);
       genNodes(nd.then, parts);
@@ -788,14 +788,14 @@ function genNodes(nodes, parts) {
       genNodes(nd.body, parts);
       parts.push(`}if(_sh)S[${nm}]=_sv;else delete S[${nm}];if(_lh)S["loop"]=_lv;else delete S["loop"];}}`);
     } else if (nd.kind === 'include') {
-      parts.push(`if(D<8){const _f=F[${JSON.stringify(nd.name)}];if(_f)_f(O,S,D+1);}`);
+      parts.push(`if(D<8){const _f=F[${JSON.stringify(nd.name)}];if(_f)O+=_f(S,D+1);}`);
     }
   }
 }
 
 /**
- * Every parsed template compiled to a function (O, S, D) in one generated
- * module, or null when the runtime refuses to compile it.
+ * Every parsed template compiled to a function (S, D) returning its output,
+ * in one generated module, or null when the runtime refuses to compile it.
  */
 function compileTemplates(parsed) {
   try {
@@ -808,7 +808,7 @@ function compileTemplates(parsed) {
     for (const [name, nodes] of parsed) {
       const body = [];
       genNodes(nodes, body);
-      parts.push(`F[${JSON.stringify(name)}]=function(O,S,D){${body.join('')}};`);
+      parts.push(`F[${JSON.stringify(name)}]=function(S,D){let O="";${body.join('')}return O;};`);
     }
     parts.push('return F;');
     return new Function('esc', parts.join('\n'))(esc);
@@ -1044,13 +1044,13 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  // One scope object and one output array serve every render of the case: a
-  // loop always restores the bindings it sets, so the scope comes back clean.
-  const scratchO = [];
+  // One scope object serves every render of the case: a loop always restores
+  // the bindings it sets, so the scope comes back clean.
   const scratchS = Object.create(null);
   scratchS.site = site;
   scratchS.tags = allTags;
   scratchS.recent = recent;
+  const scratchO = [];
   const render = (name, page, posts, pager, tag) => {
     const S = scratchS;
     S.page = page;
@@ -1060,12 +1060,11 @@ export function run(input) {
     if (compiled !== null) {
       const fn = compiled[name];
       if (fn === undefined) return null;
-      fn(scratchO, S, 0);
-    } else {
-      const nodes = parsed.get(name);
-      if (nodes === undefined) return null;
-      interpNodes(nodes, S, 0, parsed, scratchO);
+      return fn(S, 0);
     }
+    const nodes = parsed.get(name);
+    if (nodes === undefined) return null;
+    interpNodes(nodes, S, 0, parsed, scratchO);
     const html = scratchO.join('');
     scratchO.length = 0;
     return html;
