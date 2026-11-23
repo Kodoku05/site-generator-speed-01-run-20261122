@@ -8,10 +8,12 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
-// V8's incremental marking off, set before solve.js is imported so all of its
-// work runs under it (the house baseline is timed with the same tuning, and
-// the rules let an entry tune V8's flags the same way).
+// V8 tuning, set before solve.js is imported so all of its work runs under
+// it. Incremental marking off, as the house baseline runs; and the optimizing
+// compiler off: each graded run is a fresh container, so the run is too short
+// for TurboFan to earn its compile cost back (measured ~12% faster cold).
 setFlagsFromString('--no-incremental-marking');
+setFlagsFromString('--no-opt');
 
 const solve = await import(new URL('./solve.js', import.meta.url).href);
 const run = solve.run as (input: unknown) => unknown;

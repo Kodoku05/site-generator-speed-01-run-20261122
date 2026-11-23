@@ -89,20 +89,24 @@ const UNI_WS = /[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]/
 
 /** The words of a body: its runs of characters other than whitespace. */
 function wordsOf(text) {
-  if (UNI_WS.test(text)) {
-    const m = text.match(/\S+/g);
-    return m === null ? 0 : m.length;
-  }
   let n = 0;
   let inWord = false;
-  for (let i = 0; i < text.length; i++) {
+  let nonAscii = false;
+  for (let i = 0, len = text.length; i < len; i++) {
     const c = text.charCodeAt(i);
-    const ws = c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13;
+    if (c > 127) nonAscii = true;
+    const ws = c === 32 || (c >= 9 && c <= 13);
     if (ws) inWord = false;
     else if (!inWord) {
       inWord = true;
       n++;
     }
+  }
+  // A non-ASCII body may hold Unicode whitespace the byte scan counts as
+  // word characters; only then pay for the exact count.
+  if (nonAscii && UNI_WS.test(text)) {
+    const m = text.match(/\S+/g);
+    return m === null ? 0 : m.length;
   }
   return n;
 }
@@ -497,7 +501,7 @@ function inlineMd(s, link) {
  */
 function renderMd(src, link, slugFn) {
   const lines = src.split('\n');
-  const out = [];
+  let out = '';
   const toc = [];
   const ids = new Set();
   let excerpt = null;
@@ -522,7 +526,8 @@ function renderMd(src, link, slugFn) {
         while (i < n && !isFenceClose(lines[i])) code += `${esc(lines[i++])}\n`;
         i++;
         code += '</code></pre>';
-        out.push(code);
+        out += code;
+        out += '\n';
         continue;
       }
     } else if (c0 === 35) {
@@ -530,14 +535,15 @@ function renderMd(src, link, slugFn) {
       if (hd !== null) {
         const id = uniqSlug(slugFn(hd.text), ids);
         const html = inlineMd(hd.text, link);
-        out.push(`<h${hd.depth} id="${id}">${html}</h${hd.depth}>`);
+        out += `<h${hd.depth} id="${id}">${html}</h${hd.depth}>`;
+        out += '\n';
         if (hd.depth === 2 || hd.depth === 3) toc.push({ level: hd.depth, id, html });
         i++;
         continue;
       }
     } else if (c0 === 45 || c0 === 42) {
       if (isHR(line)) {
-        out.push('<hr>');
+        out += '<hr>\n';
         i++;
         continue;
       }
@@ -550,7 +556,8 @@ function renderMd(src, link, slugFn) {
         ql = trimLt(ql);
         if (ql !== '') q.push(ql);
       }
-      out.push(q.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inlineMd(q.join('\n'), link)}</p>\n</blockquote>`);
+      out += q.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inlineMd(q.join('\n'), link)}</p>\n</blockquote>`;
+      out += '\n';
       continue;
     } else if (c0 >= 48 && c0 <= 57) {
       first = orderedOf(line);
@@ -576,7 +583,8 @@ function renderMd(src, link, slugFn) {
       lst += '\n';
       for (const it of items) lst += `<li>${inlineMd(it.join('\n'), link)}</li>\n`;
       lst += `</${tag}>`;
-      out.push(lst);
+      out += lst;
+      out += '\n';
       continue;
     }
     const para = [trimLt(line)];
@@ -584,9 +592,10 @@ function renderMd(src, link, slugFn) {
     while (i < n && !paraBreak(lines[i])) para.push(trimLt(lines[i++]));
     const html = inlineMd(para.join('\n'), link);
     if (excerpt === null) excerpt = html;
-    out.push(`<p>${html}</p>`);
+    out += `<p>${html}</p>`;
+    out += '\n';
   }
-  return { html: out.length === 0 ? '' : `${out.join('\n')}\n`, toc, excerpt: excerpt === null ? '' : excerpt };
+  return { html: out, toc, excerpt: excerpt === null ? '' : excerpt };
 }
 
 // ---------------------------------------------------------------- templates
@@ -854,7 +863,7 @@ function cardOf(s) {
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    tags: s.tagRefs.map((t) => t.view),
   };
 }
 
@@ -906,7 +915,8 @@ export function run(input) {
   for (const f of files) {
     if (f.path.endsWith('.md')) {
       const text = f.content.indexOf('\r') === -1 ? f.content : f.content.replace(/\r\n?/g, '\n');
-      sources.push({ path: f.path, text });
+      // Every field up front, so every source shares one shape.
+      sources.push({ path: f.path, text, data: null, body: '', post: false, layout: '', slug: '', outDir: '', url: '', html: '', toc: null, excerpt: '', newer: null, older: null, tagRefs: null });
     } else statics.push(f);
   }
 
@@ -1025,6 +1035,7 @@ export function run(input) {
       let tag = bySlug.get(sl);
       if (tag === undefined) {
         tag = { name, slug: sl, url: `${base}/tags/${sl}/`, posts: [] };
+        tag.view = { name, slug: sl, url: tag.url };
         bySlug.set(sl, tag);
       }
       tag.posts.push(p);
@@ -1033,7 +1044,14 @@ export function run(input) {
   }
   for (const s of kept) {
     if (!s.post) {
-      s.tagRefs = ownTags(s).map((name) => bySlug.get(slugFn(name)) ?? { name, slug: slugFn(name), url: '', posts: [] });
+      s.tagRefs = ownTags(s).map((name) => {
+        const sl = slugFn(name);
+        const found = bySlug.get(sl);
+        if (found !== undefined) return found;
+        const t = { name, slug: sl, url: '', posts: [] };
+        t.view = { name, slug: sl, url: '' };
+        return t;
+      });
     }
   }
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || cmp(x.slug, y.slug));
